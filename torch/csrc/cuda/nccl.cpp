@@ -950,6 +950,30 @@ void gather(
   auto type = to_nccl_data_type(inputs);
   const auto* sendbuff = reinterpret_cast<const char*>(inputs.const_data_ptr());
 
+#if !defined(USE_ROCM) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+  // Native collective gather (NCCL 2.28+). Unlike the send/recv loop below, it
+  // reuses NCCL's existing channel connections rather than opening a dedicated
+  // point-to-point connection (QP) from root to every rank, so the root's QP
+  // count no longer scales with the world size. NCCL writes rank i's data at
+  // recvbuff + i*count, so the root stages into a flat contiguous buffer and
+  // then copies each slice into the (separately allocated) output tensors. The
+  // stream guard keeps the allocation and copies ordered on `stream`.
+  c10::cuda::CUDAStreamGuard guard(stream);
+  const auto icount = static_cast<int64_t>(count);
+  at::Tensor flat;
+  void* recvbuff = nullptr;
+  if (cur_rank == root) {
+    flat = at::empty({numranks * icount}, inputs.options());
+    recvbuff = flat.mutable_data_ptr();
+  }
+  NCCL_CHECK_TIMEOUT(
+      ncclGather(sendbuff, recvbuff, count, type, root, comm, stream), _comm);
+  if (cur_rank == root) {
+    for (const auto r : c10::irange(numranks)) {
+      outputs[r].copy_(flat.narrow(0, r * icount, icount).view_as(outputs[r]));
+    }
+  }
+#else
   NCCL_CHECK(ncclGroupStart());
 
   if (cur_rank == root) {
@@ -966,6 +990,7 @@ void gather(
     NCCL_CHECK(ncclSend(sendbuff, count, type, root, comm, stream));
   }
   NCCL_CHECK_TIMEOUT(ncclGroupEnd(), _comm);
+#endif
 
 #else
   TORCH_CHECK(false, "PyTorch built without NCCL support");
@@ -985,6 +1010,31 @@ void scatter(
   int numranks = 0, cur_rank = 0;
   NCCL_CHECK_TIMEOUT(ncclCommCount(comm, &numranks), _comm);
   NCCL_CHECK_TIMEOUT(ncclCommUserRank(comm, &cur_rank), _comm);
+
+#if !defined(USE_ROCM) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+  // Native collective scatter (NCCL 2.28+). See the comment in gather(): this
+  // reuses NCCL's channel connections instead of opening a dedicated QP from
+  // root to every rank. NCCL reads rank i's data from sendbuff + i*count, so
+  // the root packs the (separately allocated) input tensors into a flat
+  // contiguous buffer first. The stream guard keeps the allocation and copies
+  // ordered on `stream`.
+  c10::cuda::CUDAStreamGuard guard(stream);
+  size_t count = outputs.numel();
+  auto type = to_nccl_data_type(outputs);
+  auto* recvbuff = reinterpret_cast<char*>(outputs.mutable_data_ptr());
+  const auto icount = static_cast<int64_t>(count);
+  at::Tensor flat;
+  const void* sendbuff = nullptr;
+  if (cur_rank == root) {
+    flat = at::empty({numranks * icount}, outputs.options());
+    for (const auto r : c10::irange(numranks)) {
+      flat.narrow(0, r * icount, icount).view_as(inputs[r]).copy_(inputs[r]);
+    }
+    sendbuff = flat.const_data_ptr();
+  }
+  NCCL_CHECK_TIMEOUT(
+      ncclScatter(sendbuff, recvbuff, count, type, root, comm, stream), _comm);
+#else
   NCCL_CHECK(ncclGroupStart());
   if (cur_rank == root) {
     for (const auto r : c10::irange(numranks)) {
@@ -1006,6 +1056,7 @@ void scatter(
     NCCL_CHECK(ncclRecv(recvbuff, recv_count, recv_type, root, comm, stream));
   }
   NCCL_CHECK_TIMEOUT(ncclGroupEnd(), _comm);
+#endif
 #else
   TORCH_CHECK(false, "PyTorch built without NCCL support");
 #endif
